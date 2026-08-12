@@ -1,4 +1,9 @@
 #include <Arduino.h>
+#include <WiFi.h>
+
+// --- WiFi ---
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 
 // A01ANY4B ultrasonic sensor, RS485/Modbus RTU variant, via auto-direction TTL<->RS485 module.
 // Sensor: red->5-12V (own supply, not ESP32 3.3V), black->GND, yellow->A+, white->B-
@@ -46,6 +51,24 @@ uint16_t crc16(uint8_t *buffer, uint16_t buffer_length) {
   return (crc_hi << 8 | crc_lo);
 }
 
+uint32_t wifiRetryAt = 0;
+
+bool wifiIsUp() {
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void ensureWifi() {
+  if (wifiIsUp()) return;
+  if (millis() - wifiRetryAt < 5000) return; // retry every 5s, don't block
+  wifiRetryAt = millis();
+
+  if (WiFi.status() != WL_CONNECT_FAILED && WiFi.status() != WL_IDLE_STATUS) {
+    Serial.println("WiFi: connecting...");
+  }
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(2000); // let USB-CDC enumerate before first print
@@ -54,9 +77,27 @@ void setup() {
   sensorSerial.begin(9600, SERIAL_8N1, SENSOR_RX, SENSOR_TX);
 
   Serial.println("=== A01ANY4B Modbus RTU sensor starting ===");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi: connecting");
+  uint32_t wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (wifiIsUp()) {
+    Serial.print("WiFi connected, IP=");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi not connected yet, will keep retrying in loop()");
+  }
 }
 
 void loop() {
+  ensureWifi();
+
   static uint32_t trigger_cnt = 0;
   static uint8_t recv_buf[10] = {0};
 
