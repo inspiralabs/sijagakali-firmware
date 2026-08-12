@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <time.h>
+#include <Preferences.h>
 
 // --- WiFi ---
 #define WIFI_SSID "YOUR_WIFI_SSID"
@@ -11,7 +12,7 @@
 #include <ArduinoJson.h>
 
 // --- MQTT ---
-#define MQTT_HOST "127.0.0.1"
+#define MQTT_HOST "YOUR_MQTT_BROKER_IP"
 #define MQTT_PORT 1883
 #define MQTT_USER ""       // leave empty if broker has no auth
 #define MQTT_PASSWORD ""
@@ -26,7 +27,10 @@ float sensorHeightCm = SENSOR_HEIGHT_CM_DEFAULT;
 uint32_t readIntervalSec = READ_INTERVAL_SEC_DEFAULT;
 
 float lastDistanceCm = 0.0;
+uint32_t lastDistanceAt = 0; // millis() of last successful sensor read; 0 = no reading yet
 uint32_t trigger_cnt_reset_flag = 0;
+
+Preferences prefs;
 
 #define STATUS_INTERVAL_SEC_DEFAULT 120
 uint32_t statusIntervalSec = STATUS_INTERVAL_SEC_DEFAULT;
@@ -162,6 +166,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       int newInterval = doc["interval_sec"].as<int>();
       if (newInterval >= 10) {
         readIntervalSec = (uint32_t)newInterval;
+        prefs.putUInt("interval", readIntervalSec);
         Serial.print("Config: read_interval_sec updated to ");
         Serial.println(readIntervalSec);
       }
@@ -178,21 +183,24 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       delay(200); // let the publish flush before reboot
       ESP.restart();
     } else if (strcmp(cmd, "calibrate") == 0) {
-      if (doc["params"]["reference_water_level_cm"].is<float>()) {
-        // Operator stands a known water level (reference) below the sensor;
-        // sensorHeightCm = that reference + whatever raw distance we're reading right now.
-        // Since calibrate is async, we snapshot the last known distance below (Task 6 stores it).
-        extern float lastDistanceCm; // defined in Task 6
-        float referenceCm = doc["params"]["reference_water_level_cm"].as<float>();
-        sensorHeightCm = referenceCm + lastDistanceCm;
-        char detail[64];
-        snprintf(detail, sizeof(detail), "sensor_height_cm=%.1f", sensorHeightCm);
-        publishCommandAck(requestId, true, detail);
+      if (!doc["params"]["reference_water_level_cm"].isNull()) {
+        if (lastDistanceAt == 0 || millis() - lastDistanceAt > 120000) {
+          publishCommandAck(requestId, false, "no recent sensor reading");
+        } else {
+          // Operator stands a known water level (reference) below the sensor;
+          // sensorHeightCm = that reference + whatever raw distance we're reading right now.
+          // Since calibrate is async, we snapshot the last known distance above.
+          float referenceCm = doc["params"]["reference_water_level_cm"].as<float>();
+          sensorHeightCm = referenceCm + lastDistanceCm;
+          prefs.putFloat("sensorH", sensorHeightCm);
+          char detail[64];
+          snprintf(detail, sizeof(detail), "sensor_height_cm=%.1f", sensorHeightCm);
+          publishCommandAck(requestId, true, detail);
+        }
       } else {
         publishCommandAck(requestId, false, "missing params.reference_water_level_cm");
       }
     } else if (strcmp(cmd, "sample_now") == 0) {
-      extern uint32_t trigger_cnt_reset_flag; // defined in Task 6
       trigger_cnt_reset_flag = 1; // force next loop() iteration to read+publish immediately
       publishCommandAck(requestId, true, "sampling on next cycle");
     } else {
@@ -227,6 +235,12 @@ void syncTimeWib() {
   Serial.println();
 }
 
+void ensureTimeSynced() {
+  if (time(nullptr) < 1600000000) { // implausible epoch: NTP never synced (or WiFi wasn't up in setup())
+    syncTimeWib();
+  }
+}
+
 void isoTimestampWib(char out[26]) {
   time_t now = time(nullptr);
   struct tm t;
@@ -257,6 +271,7 @@ void publishCommandAck(const char* requestId, bool ok, const char* detail) {
 void publishSensorData(float waterLevelCm) {
   if (!mqttClient.connected()) return;
 
+  ensureTimeSynced();
   char corrId[37];
   generateUuidV4(corrId);
   char ts[26];
@@ -266,7 +281,7 @@ void publishSensorData(float waterLevelCm) {
   doc["deployment_slug"] = DEPLOYMENT_SLUG;
   doc["device_id"] = DEVICE_ID;
   doc["correlation_id"] = corrId;
-  doc["water_level_cm"] = roundf(waterLevelCm * 10) / 10.0; // 1 decimal, matches dummy publisher precision
+  doc["water_level_cm"] = roundf(waterLevelCm * 10) / 10.0f; // 1 decimal, matches dummy publisher precision
   doc["timestamp"] = ts;
   doc["rssi"] = WiFi.RSSI();
   // no battery sensor on this board; omit battery_pct (optional field)
@@ -286,6 +301,7 @@ void publishSensorData(float waterLevelCm) {
 void publishSensorStatus() {
   if (!mqttClient.connected()) return;
 
+  ensureTimeSynced();
   char ts[26];
   isoTimestampWib(ts);
 
@@ -317,6 +333,10 @@ void setup() {
 
   Serial.println("=== A01ANY4B Modbus RTU sensor starting ===");
 
+  prefs.begin("sijagaair", false);
+  sensorHeightCm = prefs.getFloat("sensorH", SENSOR_HEIGHT_CM_DEFAULT);
+  readIntervalSec = prefs.getUInt("interval", READ_INTERVAL_SEC_DEFAULT);
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("WiFi: connecting");
@@ -337,11 +357,15 @@ void setup() {
     syncTimeWib();
   }
 
-  snprintf(topicBase, sizeof(topicBase), "sijagaair/%s/%s", DEPLOYMENT_SLUG, DEVICE_ID);
+  snprintf(topicBase, sizeof(topicBase), "sijagaair/%s", DEVICE_ID); // matches backend TOPICS: sijagaair/{device_id}/...
   snprintf(mqttClientId, sizeof(mqttClientId), "esp32-%s", DEVICE_ID);
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setBufferSize(512); // default 256 is too small for sensor/data + status JSON
   mqttClient.setCallback(mqttCallback);
+
+  // Backdate so the first loop() heartbeat check fires immediately once MQTT connects,
+  // instead of waiting a full statusIntervalSec after boot.
+  statusSentAt = millis() - (uint32_t)statusIntervalSec * 1000UL - 1;
 }
 
 void loop() {
@@ -377,6 +401,7 @@ void loop() {
         if (distanceMm > 280) {
           float distanceCm = distanceMm / 10.0;
           lastDistanceCm = distanceCm;
+          lastDistanceAt = millis();
           Serial.print("Distance = ");
           Serial.print(distanceCm);
           Serial.println(" cm");
