@@ -25,6 +25,14 @@
 float sensorHeightCm = SENSOR_HEIGHT_CM_DEFAULT;
 uint32_t readIntervalSec = READ_INTERVAL_SEC_DEFAULT;
 
+float lastDistanceCm = 0.0;
+uint32_t trigger_cnt_reset_flag = 0;
+
+#define STATUS_INTERVAL_SEC_DEFAULT 120
+uint32_t statusIntervalSec = STATUS_INTERVAL_SEC_DEFAULT;
+uint32_t statusSentAt = 0;
+#define FIRMWARE_VERSION "sijagakali-v1.0.0"
+
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 char topicBase[96];
@@ -246,6 +254,60 @@ void publishCommandAck(const char* requestId, bool ok, const char* detail) {
   mqttClient.publish(topic, (const uint8_t*)buf, n, false);
 }
 
+void publishSensorData(float waterLevelCm) {
+  if (!mqttClient.connected()) return;
+
+  char corrId[37];
+  generateUuidV4(corrId);
+  char ts[26];
+  isoTimestampWib(ts);
+
+  JsonDocument doc;
+  doc["deployment_slug"] = DEPLOYMENT_SLUG;
+  doc["device_id"] = DEVICE_ID;
+  doc["correlation_id"] = corrId;
+  doc["water_level_cm"] = roundf(waterLevelCm * 10) / 10.0; // 1 decimal, matches dummy publisher precision
+  doc["timestamp"] = ts;
+  doc["rssi"] = WiFi.RSSI();
+  // no battery sensor on this board; omit battery_pct (optional field)
+
+  char buf[384];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+
+  char topic[128];
+  snprintf(topic, sizeof(topic), "%s/sensor/data", topicBase);
+  bool ok = mqttClient.publish(topic, (const uint8_t*)buf, n, false);
+
+  Serial.print("Published sensor/data: ");
+  Serial.print(buf);
+  Serial.println(ok ? " [ok]" : " [FAILED]");
+}
+
+void publishSensorStatus() {
+  if (!mqttClient.connected()) return;
+
+  char ts[26];
+  isoTimestampWib(ts);
+
+  JsonDocument doc;
+  doc["deployment_slug"] = DEPLOYMENT_SLUG;
+  doc["device_id"] = DEVICE_ID;
+  doc["timestamp"] = ts;
+  doc["online"] = true;
+  doc["uptime_sec"] = millis() / 1000;
+  doc["firmware_version"] = FIRMWARE_VERSION;
+  doc["last_error"] = nullptr;
+  doc["heap_free_bytes"] = ESP.getFreeHeap();
+
+  char buf[320];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+
+  char topic[128];
+  snprintf(topic, sizeof(topic), "%s/sensor/status", topicBase);
+  mqttClient.publish(topic, (const uint8_t*)buf, n, false);
+  Serial.println("Published sensor/status heartbeat");
+}
+
 void setup() {
   Serial.begin(115200);
   delay(2000); // let USB-CDC enumerate before first print
@@ -289,7 +351,8 @@ void loop() {
   static uint32_t trigger_cnt = 0;
   static uint8_t recv_buf[10] = {0};
 
-  if (millis() - trigger_cnt > 500) {
+  if (millis() - trigger_cnt > (readIntervalSec * 1000UL) || trigger_cnt_reset_flag) {
+    trigger_cnt_reset_flag = 0;
     while (sensorSerial.available()) sensorSerial.read(); // drop stale bytes so the read window aligns with this request's reply
 
     // 01 03 01 01 00 01 D4 36  read real-time value -> reply: 01 03 02 <hi> <lo> <crc_hi> <crc_lo>
@@ -312,9 +375,15 @@ void loop() {
       if (calc_crc == recv_crc) {
         uint16_t distanceMm = recv_buf[3] << 8 | recv_buf[4];
         if (distanceMm > 280) {
+          float distanceCm = distanceMm / 10.0;
+          lastDistanceCm = distanceCm;
           Serial.print("Distance = ");
-          Serial.print(distanceMm / 10.0);
+          Serial.print(distanceCm);
           Serial.println(" cm");
+
+          float waterLevelCm = sensorHeightCm - distanceCm;
+          if (waterLevelCm < 0) waterLevelCm = 0; // clamp: sensor above dry channel bottom reads as 0, not negative
+          publishSensorData(waterLevelCm);
         } else {
           Serial.println("Below the lower limit");
         }
@@ -329,5 +398,10 @@ void loop() {
   if (millis() - led_cnt > 100) {
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // berkedip tiap loop jalan, indikator board hidup
     led_cnt = millis();
+  }
+
+  if (millis() - statusSentAt > (statusIntervalSec * 1000UL)) {
+    statusSentAt = millis();
+    publishSensorStatus();
   }
 }
