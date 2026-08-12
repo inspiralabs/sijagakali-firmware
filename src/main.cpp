@@ -8,6 +8,7 @@
 
 #include <WiFiClient.h>
 #include <PubSubClient.h>
+#include <ArduinoJson.h>
 
 // --- MQTT ---
 #define MQTT_HOST "127.0.0.1"
@@ -16,6 +17,13 @@
 #define MQTT_PASSWORD ""
 #define DEPLOYMENT_SLUG "sijagaair-bojong-kulur"
 #define DEVICE_ID "node-001"
+
+// --- Runtime-mutable config (defaults; can be changed via MQTT command/config) ---
+#define SENSOR_HEIGHT_CM_DEFAULT 150.0  // distance from sensor to dry-channel bottom; calibrate per install site
+#define READ_INTERVAL_SEC_DEFAULT 30
+
+float sensorHeightCm = SENSOR_HEIGHT_CM_DEFAULT;
+uint32_t readIntervalSec = READ_INTERVAL_SEC_DEFAULT;
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
@@ -89,6 +97,7 @@ void ensureWifi() {
 uint32_t mqttRetryAt = 0;
 
 void mqttCallback(char* topic, byte* payload, unsigned int length); // forward decl, implemented in Task 5
+void publishCommandAck(const char* requestId, bool ok, const char* detail); // forward decl, implemented in Task 5
 
 void ensureMqtt() {
   if (!wifiIsUp()) return;
@@ -121,7 +130,68 @@ void ensureMqtt() {
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  // handled in Task 5
+  char topicStr[128];
+  size_t topicLen = strlen(topic);
+  if (topicLen >= sizeof(topicStr)) return; // reject oversized topic, avoid overflow
+  memcpy(topicStr, topic, topicLen);
+  topicStr[topicLen] = '\0';
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) {
+    Serial.print("MQTT: JSON parse error on ");
+    Serial.println(topicStr);
+    return;
+  }
+
+  char intervalTopic[128];
+  snprintf(intervalTopic, sizeof(intervalTopic), "%s/config/interval", topicBase);
+  char commandTopic[128];
+  snprintf(commandTopic, sizeof(commandTopic), "%s/command", topicBase);
+
+  if (strcmp(topicStr, intervalTopic) == 0) {
+    if (doc["interval_sec"].is<int>()) {
+      int newInterval = doc["interval_sec"].as<int>();
+      if (newInterval >= 10) {
+        readIntervalSec = (uint32_t)newInterval;
+        Serial.print("Config: read_interval_sec updated to ");
+        Serial.println(readIntervalSec);
+      }
+    }
+    return;
+  }
+
+  if (strcmp(topicStr, commandTopic) == 0) {
+    const char* cmd = doc["cmd"] | "";
+    const char* requestId = doc["request_id"] | "";
+
+    if (strcmp(cmd, "restart") == 0) {
+      publishCommandAck(requestId, true, "restarting");
+      delay(200); // let the publish flush before reboot
+      ESP.restart();
+    } else if (strcmp(cmd, "calibrate") == 0) {
+      if (doc["params"]["reference_water_level_cm"].is<float>()) {
+        // Operator stands a known water level (reference) below the sensor;
+        // sensorHeightCm = that reference + whatever raw distance we're reading right now.
+        // Since calibrate is async, we snapshot the last known distance below (Task 6 stores it).
+        extern float lastDistanceCm; // defined in Task 6
+        float referenceCm = doc["params"]["reference_water_level_cm"].as<float>();
+        sensorHeightCm = referenceCm + lastDistanceCm;
+        char detail[64];
+        snprintf(detail, sizeof(detail), "sensor_height_cm=%.1f", sensorHeightCm);
+        publishCommandAck(requestId, true, detail);
+      } else {
+        publishCommandAck(requestId, false, "missing params.reference_water_level_cm");
+      }
+    } else if (strcmp(cmd, "sample_now") == 0) {
+      extern uint32_t trigger_cnt_reset_flag; // defined in Task 6
+      trigger_cnt_reset_flag = 1; // force next loop() iteration to read+publish immediately
+      publishCommandAck(requestId, true, "sampling on next cycle");
+    } else {
+      publishCommandAck(requestId, false, "unknown cmd");
+    }
+    return;
+  }
 }
 
 void generateUuidV4(char out[37]) {
@@ -155,6 +225,25 @@ void isoTimestampWib(char out[26]) {
   localtime_r(&now, &t);
   snprintf(out, 26, "%04d-%02d-%02dT%02d:%02d:%02d+07:00",
     t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+}
+
+void publishCommandAck(const char* requestId, bool ok, const char* detail) {
+  if (!mqttClient.connected()) return;
+
+  JsonDocument doc;
+  doc["request_id"] = requestId;
+  doc["ok"] = ok;
+  doc["detail"] = detail;
+  char ts[26];
+  isoTimestampWib(ts);
+  doc["timestamp"] = ts;
+
+  char buf[256];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+
+  char topic[128];
+  snprintf(topic, sizeof(topic), "%s/command/ack", topicBase);
+  mqttClient.publish(topic, (const uint8_t*)buf, n, false);
 }
 
 void setup() {
