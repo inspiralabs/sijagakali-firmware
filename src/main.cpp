@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <time.h>
 
 // --- WiFi ---
 #define WIFI_SSID "YOUR_WIFI_SSID"
@@ -123,6 +124,39 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // handled in Task 5
 }
 
+void generateUuidV4(char out[37]) {
+  uint8_t b[16];
+  for (int i = 0; i < 16; i++) b[i] = (uint8_t)(esp_random() & 0xFF);
+  b[6] = (b[6] & 0x0F) | 0x40; // version 4
+  b[8] = (b[8] & 0x3F) | 0x80; // variant 10xx
+
+  snprintf(out, 37,
+    "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+}
+
+void syncTimeWib() {
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com"); // UTC+7 (WIB), no DST
+  Serial.print("NTP: syncing time");
+  time_t now = time(nullptr);
+  uint32_t start = millis();
+  while (now < 8 * 3600 * 2 && millis() - start < 10000) { // wait for a plausible epoch time, max 10s
+    delay(250);
+    Serial.print(".");
+    now = time(nullptr);
+  }
+  Serial.println();
+}
+
+void isoTimestampWib(char out[26]) {
+  time_t now = time(nullptr);
+  struct tm t;
+  localtime_r(&now, &t);
+  snprintf(out, 26, "%04d-%02d-%02dT%02d:%02d:%02d+07:00",
+    t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(2000); // let USB-CDC enumerate before first print
@@ -146,6 +180,10 @@ void setup() {
     Serial.println(WiFi.localIP());
   } else {
     Serial.println("WiFi not connected yet, will keep retrying in loop()");
+  }
+
+  if (wifiIsUp()) {
+    syncTimeWib();
   }
 
   snprintf(topicBase, sizeof(topicBase), "sijagaair/%s/%s", DEPLOYMENT_SLUG, DEVICE_ID);
