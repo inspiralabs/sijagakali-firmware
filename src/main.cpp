@@ -5,6 +5,22 @@
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 
+#include <WiFiClient.h>
+#include <PubSubClient.h>
+
+// --- MQTT ---
+#define MQTT_HOST "127.0.0.1"
+#define MQTT_PORT 1883
+#define MQTT_USER ""       // leave empty if broker has no auth
+#define MQTT_PASSWORD ""
+#define DEPLOYMENT_SLUG "sijagaair-bojong-kulur"
+#define DEVICE_ID "node-001"
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+char topicBase[96];
+char mqttClientId[48];
+
 // A01ANY4B ultrasonic sensor, RS485/Modbus RTU variant, via auto-direction TTL<->RS485 module.
 // Sensor: red->5-12V (own supply, not ESP32 3.3V), black->GND, yellow->A+, white->B-
 // Module: TXD->GPIO5(ESP RX)  RXD->GPIO4(ESP TX)  VCC->5V  GND->GND (common with sensor+ESP32)
@@ -69,6 +85,44 @@ void ensureWifi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
+uint32_t mqttRetryAt = 0;
+
+void mqttCallback(char* topic, byte* payload, unsigned int length); // forward decl, implemented in Task 5
+
+void ensureMqtt() {
+  if (!wifiIsUp()) return;
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+    return;
+  }
+  if (millis() - mqttRetryAt < 5000) return; // retry every 5s, don't block
+  mqttRetryAt = millis();
+
+  Serial.print("MQTT: connecting...");
+  bool ok;
+  if (strlen(MQTT_USER) > 0) {
+    ok = mqttClient.connect(mqttClientId, MQTT_USER, MQTT_PASSWORD);
+  } else {
+    ok = mqttClient.connect(mqttClientId);
+  }
+
+  if (ok) {
+    Serial.println(" connected");
+    char subTopic[128];
+    snprintf(subTopic, sizeof(subTopic), "%s/config/interval", topicBase);
+    mqttClient.subscribe(subTopic, 1);
+    snprintf(subTopic, sizeof(subTopic), "%s/command", topicBase);
+    mqttClient.subscribe(subTopic, 1);
+  } else {
+    Serial.print(" failed, rc=");
+    Serial.println(mqttClient.state());
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  // handled in Task 5
+}
+
 void setup() {
   Serial.begin(115200);
   delay(2000); // let USB-CDC enumerate before first print
@@ -93,10 +147,17 @@ void setup() {
   } else {
     Serial.println("WiFi not connected yet, will keep retrying in loop()");
   }
+
+  snprintf(topicBase, sizeof(topicBase), "sijagaair/%s/%s", DEPLOYMENT_SLUG, DEVICE_ID);
+  snprintf(mqttClientId, sizeof(mqttClientId), "esp32-%s", DEVICE_ID);
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setBufferSize(512); // default 256 is too small for sensor/data + status JSON
+  mqttClient.setCallback(mqttCallback);
 }
 
 void loop() {
   ensureWifi();
+  ensureMqtt();
 
   static uint32_t trigger_cnt = 0;
   static uint8_t recv_buf[10] = {0};
