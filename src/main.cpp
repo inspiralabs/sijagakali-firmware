@@ -16,7 +16,7 @@
 #define MQTT_PORT 1883
 #define MQTT_USER ""       // leave empty if broker has no auth
 #define MQTT_PASSWORD ""
-#define DEPLOYMENT_SLUG "sijagaair-bojong-kulur"
+#define DEPLOYMENT_SLUG "sijagakali-bojong-kulur"
 #define DEVICE_ID "node-001"
 
 // --- Runtime-mutable config (defaults; can be changed via MQTT command/config) ---
@@ -333,7 +333,7 @@ void setup() {
 
   Serial.println("=== A01ANY4B Modbus RTU sensor starting ===");
 
-  prefs.begin("sijagaair", false);
+  prefs.begin("sijagakali", false);
   sensorHeightCm = prefs.getFloat("sensorH", SENSOR_HEIGHT_CM_DEFAULT);
   readIntervalSec = prefs.getUInt("interval", READ_INTERVAL_SEC_DEFAULT);
 
@@ -357,7 +357,7 @@ void setup() {
     syncTimeWib();
   }
 
-  snprintf(topicBase, sizeof(topicBase), "sijagaair/%s", DEVICE_ID); // matches backend TOPICS: sijagaair/{device_id}/...
+  snprintf(topicBase, sizeof(topicBase), "sijagakali/%s", DEVICE_ID); // matches backend TOPICS: sijagakali/{device_id}/...
   snprintf(mqttClientId, sizeof(mqttClientId), "esp32-%s", DEVICE_ID);
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setBufferSize(512); // default 256 is too small for sensor/data + status JSON
