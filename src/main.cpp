@@ -37,6 +37,15 @@ float lastDistanceCm = 0.0;
 uint32_t lastDistanceAt = 0; // millis() of last successful sensor read; 0 = no reading yet
 uint32_t trigger_cnt_reset_flag = 0;
 
+// OTA is deferred to loop() rather than run inside the MQTT event callback: esp-mqtt's
+// internal client task has only a 6144-byte stack (too small for TLS handshake +
+// HTTPUpdate's flash-write loop) and holds esp-mqtt's API lock while dispatching events,
+// which would block publish()/PINGREQ for the whole update. loop() runs in Arduino's
+// loopTask (8192-byte stack) and doesn't hold that lock.
+volatile bool otaUpdatePending = false;
+char otaUpdateUrl[256] = {0};
+char otaUpdateRequestId[64] = {0};
+
 Preferences prefs;
 
 #define STATUS_INTERVAL_SEC_DEFAULT 120
@@ -115,7 +124,7 @@ void ensureWifi() {
 
 void mqttCallback(const char* topicStr, const uint8_t* payload, size_t length); // forward decl
 void publishCommandAck(const char* requestId, bool ok, const char* detail); // forward decl
-void performOtaUpdate(const char* requestId, const char* url); // forward decl, unchanged below
+void performOtaUpdate(const char* requestId, const char* url); // forward decl, defined below, invoked from loop() (not from mqttCallback)
 
 static void mqttEventHandler(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data) {
   esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
@@ -216,8 +225,14 @@ void mqttCallback(const char* topicStr, const uint8_t* payload, size_t length) {
       const char* url = doc["params"]["url"] | "";
       if (strlen(url) == 0) {
         publishCommandAck(requestId, false, "missing params.url");
+      } else if (otaUpdatePending) {
+        publishCommandAck(requestId, false, "update already in progress");
       } else {
-        performOtaUpdate(requestId, url);
+        strncpy(otaUpdateUrl, url, sizeof(otaUpdateUrl) - 1);
+        otaUpdateUrl[sizeof(otaUpdateUrl) - 1] = '\0';
+        strncpy(otaUpdateRequestId, requestId, sizeof(otaUpdateRequestId) - 1);
+        otaUpdateRequestId[sizeof(otaUpdateRequestId) - 1] = '\0';
+        otaUpdatePending = true; // actual update runs from loop(), not here — see globals above
       }
     } else {
       publishCommandAck(requestId, false, "unknown cmd");
@@ -425,6 +440,11 @@ void setup() {
 
 void loop() {
   ensureWifi();
+
+  if (otaUpdatePending) {
+    otaUpdatePending = false;
+    performOtaUpdate(otaUpdateRequestId, otaUpdateUrl);
+  }
 
   static uint32_t trigger_cnt = 0;
   static uint8_t recv_buf[10] = {0};

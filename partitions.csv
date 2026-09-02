@@ -1,3 +1,7 @@
+# NOTE: OTA updates only ever rewrite the app0/app1 slots, never this table.
+# Any future firmware image must stay <= 0x1E0000 (1,966,080) bytes, or the
+# device needs a physical USB reflash with an updated partitions.csv — OTA
+# cannot change the partition table itself.
 # Name,   Type, SubType, Offset,  Size, Flags
 nvs,      data, nvs,     0x9000,  0x5000,
 otadata,  data, ota,     0xe000,  0x2000,
