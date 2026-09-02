@@ -7,15 +7,22 @@
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 
-#include <WiFiClient.h>
-#include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <HTTPUpdate.h>
+#include <WiFiClientSecure.h>
+#include "mqtt_client.h"
+#include "esp_crt_bundle.h"
 
 // --- MQTT ---
-#define MQTT_HOST "YOUR_MQTT_BROKER_IP"
-#define MQTT_PORT 1883
-#define MQTT_USER ""       // leave empty if broker has no auth
-#define MQTT_PASSWORD ""
+// Public hostname routed through Cloudflare Tunnel to mosquitto's
+// "listener 1773 / protocol websockets" (see mosquitto-conf/mosquitto.conf).
+// No port needed here: Cloudflare Tunnel serves this on the standard 443,
+// the internal 1773 is only used between cloudflared and mosquitto locally.
+#define MQTT_BROKER_URI "wss://YOUR_CLOUDFLARE_HOSTNAME/mqtt"
+// Must equal this device's mosquitto username (see Task 1 Step 1) so the
+// broker's ACL pattern "sijagakali/%u/#" scopes it to its own topics.
+#define MQTT_USER "node-001"
+#define MQTT_PASSWORD "YOUR_DEVICE_MQTT_PASSWORD"
 #define DEPLOYMENT_SLUG "sijagakali-bojong-kulur"
 #define DEVICE_ID "node-001"
 
@@ -37,8 +44,8 @@ uint32_t statusIntervalSec = STATUS_INTERVAL_SEC_DEFAULT;
 uint32_t statusSentAt = 0;
 #define FIRMWARE_VERSION "sijagakali-v1.0.0"
 
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
+esp_mqtt_client_handle_t mqttClient = nullptr;
+volatile bool mqttConnected = false;
 char topicBase[96];
 char mqttClientId[48];
 
@@ -106,48 +113,54 @@ void ensureWifi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
-uint32_t mqttRetryAt = 0;
+void mqttCallback(const char* topicStr, const uint8_t* payload, size_t length); // forward decl
+void publishCommandAck(const char* requestId, bool ok, const char* detail); // forward decl
+// NOTE: the migration brief's Step 3/4 also forward-declared performOtaUpdate() and an
+// "ota_update" command branch as "unchanged below" — but no such function or branch exists
+// anywhere in this file (nor is one specified by the brief). Omitted here to match this
+// file's actual current command set (restart/calibrate/sample_now) exactly; flagged for
+// controller review rather than inventing OTA-update logic out of scope for this task.
 
-void mqttCallback(char* topic, byte* payload, unsigned int length); // forward decl, implemented in Task 5
-void publishCommandAck(const char* requestId, bool ok, const char* detail); // forward decl, implemented in Task 5
+static void mqttEventHandler(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data) {
+  esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
 
-void ensureMqtt() {
-  if (!wifiIsUp()) return;
-  if (mqttClient.connected()) {
-    mqttClient.loop();
-    return;
-  }
-  if (millis() - mqttRetryAt < 5000) return; // retry every 5s, don't block
-  mqttRetryAt = millis();
-
-  Serial.print("MQTT: connecting...");
-  bool ok;
-  if (strlen(MQTT_USER) > 0) {
-    ok = mqttClient.connect(mqttClientId, MQTT_USER, MQTT_PASSWORD);
-  } else {
-    ok = mqttClient.connect(mqttClientId);
-  }
-
-  if (ok) {
-    Serial.println(" connected");
-    char subTopic[128];
-    snprintf(subTopic, sizeof(subTopic), "%s/config/interval", topicBase);
-    mqttClient.subscribe(subTopic, 1);
-    snprintf(subTopic, sizeof(subTopic), "%s/command", topicBase);
-    mqttClient.subscribe(subTopic, 1);
-  } else {
-    Serial.print(" failed, rc=");
-    Serial.println(mqttClient.state());
+  switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED: {
+      mqttConnected = true;
+      Serial.println("MQTT: connected");
+      char subTopic[128];
+      snprintf(subTopic, sizeof(subTopic), "%s/config/interval", topicBase);
+      esp_mqtt_client_subscribe(mqttClient, subTopic, 1);
+      snprintf(subTopic, sizeof(subTopic), "%s/command", topicBase);
+      esp_mqtt_client_subscribe(mqttClient, subTopic, 1);
+      break;
+    }
+    case MQTT_EVENT_DISCONNECTED:
+      mqttConnected = false;
+      Serial.println("MQTT: disconnected");
+      break;
+    case MQTT_EVENT_DATA: {
+      // Our JSON payloads are always well under the buffer size, so a message
+      // never arrives split across multiple DATA events. If that assumption
+      // is ever violated, drop it rather than parse a partial payload.
+      if (event->current_data_offset != 0 || event->data_len != event->total_data_len) {
+        Serial.println("MQTT: dropping unexpectedly fragmented message");
+        break;
+      }
+      char topicStr[128];
+      size_t topicLen = event->topic_len;
+      if (topicLen >= sizeof(topicStr)) break; // reject oversized topic, avoid overflow
+      memcpy(topicStr, event->topic, topicLen);
+      topicStr[topicLen] = '\0';
+      mqttCallback(topicStr, (const uint8_t*)event->data, event->data_len);
+      break;
+    }
+    default:
+      break;
   }
 }
 
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  char topicStr[128];
-  size_t topicLen = strlen(topic);
-  if (topicLen >= sizeof(topicStr)) return; // reject oversized topic, avoid overflow
-  memcpy(topicStr, topic, topicLen);
-  topicStr[topicLen] = '\0';
-
+void mqttCallback(const char* topicStr, const uint8_t* payload, size_t length) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload, length);
   if (err) {
@@ -250,7 +263,7 @@ void isoTimestampWib(char out[26]) {
 }
 
 void publishCommandAck(const char* requestId, bool ok, const char* detail) {
-  if (!mqttClient.connected()) return;
+  if (!mqttConnected) return;
 
   JsonDocument doc;
   doc["request_id"] = requestId;
@@ -265,11 +278,11 @@ void publishCommandAck(const char* requestId, bool ok, const char* detail) {
 
   char topic[128];
   snprintf(topic, sizeof(topic), "%s/command/ack", topicBase);
-  mqttClient.publish(topic, (const uint8_t*)buf, n, false);
+  esp_mqtt_client_publish(mqttClient, topic, buf, n, 0, 0); // qos=0, retain=0 — same as before
 }
 
 void publishSensorData(float waterLevelCm) {
-  if (!mqttClient.connected()) return;
+  if (!mqttConnected) return;
 
   ensureTimeSynced();
   char corrId[37];
@@ -291,15 +304,15 @@ void publishSensorData(float waterLevelCm) {
 
   char topic[128];
   snprintf(topic, sizeof(topic), "%s/sensor/data", topicBase);
-  bool ok = mqttClient.publish(topic, (const uint8_t*)buf, n, false);
+  int msgId = esp_mqtt_client_publish(mqttClient, topic, buf, n, 0, 0);
 
   Serial.print("Published sensor/data: ");
   Serial.print(buf);
-  Serial.println(ok ? " [ok]" : " [FAILED]");
+  Serial.println(msgId >= 0 ? " [ok]" : " [FAILED]");
 }
 
 void publishSensorStatus() {
-  if (!mqttClient.connected()) return;
+  if (!mqttConnected) return;
 
   ensureTimeSynced();
   char ts[26];
@@ -320,7 +333,7 @@ void publishSensorStatus() {
 
   char topic[128];
   snprintf(topic, sizeof(topic), "%s/sensor/status", topicBase);
-  mqttClient.publish(topic, (const uint8_t*)buf, n, false);
+  esp_mqtt_client_publish(mqttClient, topic, buf, n, 0, 0);
   Serial.println("Published sensor/status heartbeat");
 }
 
@@ -359,9 +372,19 @@ void setup() {
 
   snprintf(topicBase, sizeof(topicBase), "sijagakali/%s", DEVICE_ID); // matches backend TOPICS: sijagakali/{device_id}/...
   snprintf(mqttClientId, sizeof(mqttClientId), "esp32-%s", DEVICE_ID);
-  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-  mqttClient.setBufferSize(512); // default 256 is too small for sensor/data + status JSON
-  mqttClient.setCallback(mqttCallback);
+
+  esp_mqtt_client_config_t mqttCfg = {};
+  mqttCfg.broker.address.uri = MQTT_BROKER_URI;
+  mqttCfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+  mqttCfg.credentials.username = MQTT_USER;
+  mqttCfg.credentials.authentication.password = MQTT_PASSWORD;
+  mqttCfg.credentials.client_id = mqttClientId;
+  mqttCfg.session.keepalive = 45; // stay well under Cloudflare's free-tier ~100s idle websocket timeout
+  mqttCfg.buffer.size = 512; // default 256 is too small for sensor/data + status JSON
+
+  mqttClient = esp_mqtt_client_init(&mqttCfg);
+  esp_mqtt_client_register_event(mqttClient, MQTT_EVENT_ANY, mqttEventHandler, nullptr);
+  esp_mqtt_client_start(mqttClient);
 
   // Backdate so the first loop() heartbeat check fires immediately once MQTT connects,
   // instead of waiting a full statusIntervalSec after boot.
@@ -370,7 +393,6 @@ void setup() {
 
 void loop() {
   ensureWifi();
-  ensureMqtt();
 
   static uint32_t trigger_cnt = 0;
   static uint8_t recv_buf[10] = {0};
