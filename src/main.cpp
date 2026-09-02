@@ -115,11 +115,7 @@ void ensureWifi() {
 
 void mqttCallback(const char* topicStr, const uint8_t* payload, size_t length); // forward decl
 void publishCommandAck(const char* requestId, bool ok, const char* detail); // forward decl
-// NOTE: the migration brief's Step 3/4 also forward-declared performOtaUpdate() and an
-// "ota_update" command branch as "unchanged below" — but no such function or branch exists
-// anywhere in this file (nor is one specified by the brief). Omitted here to match this
-// file's actual current command set (restart/calibrate/sample_now) exactly; flagged for
-// controller review rather than inventing OTA-update logic out of scope for this task.
+void performOtaUpdate(const char* requestId, const char* url); // forward decl, unchanged below
 
 static void mqttEventHandler(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data) {
   esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
@@ -216,6 +212,13 @@ void mqttCallback(const char* topicStr, const uint8_t* payload, size_t length) {
     } else if (strcmp(cmd, "sample_now") == 0) {
       trigger_cnt_reset_flag = 1; // force next loop() iteration to read+publish immediately
       publishCommandAck(requestId, true, "sampling on next cycle");
+    } else if (strcmp(cmd, "ota_update") == 0) {
+      const char* url = doc["params"]["url"] | "";
+      if (strlen(url) == 0) {
+        publishCommandAck(requestId, false, "missing params.url");
+      } else {
+        performOtaUpdate(requestId, url);
+      }
     } else {
       publishCommandAck(requestId, false, "unknown cmd");
     }
@@ -279,6 +282,35 @@ void publishCommandAck(const char* requestId, bool ok, const char* detail) {
   char topic[128];
   snprintf(topic, sizeof(topic), "%s/command/ack", topicBase);
   esp_mqtt_client_publish(mqttClient, topic, buf, n, 0, 0); // qos=0, retain=0 — same as before
+}
+
+void performOtaUpdate(const char* requestId, const char* url) {
+  Serial.print("OTA: updating from ");
+  Serial.println(url);
+
+  WiFiClientSecure client;
+  client.setInsecure(); // trust the URL supplied via MQTT command; no fixed CA to pin against
+
+  httpUpdate.rebootOnUpdate(false); // let us ack over MQTT before rebooting, same pattern as "restart"
+  t_httpUpdate_return result = httpUpdate.update(client, url);
+
+  switch (result) {
+    case HTTP_UPDATE_OK:
+      publishCommandAck(requestId, true, "update ok, restarting");
+      delay(200); // let the publish flush before reboot
+      ESP.restart();
+      break;
+    case HTTP_UPDATE_NO_UPDATES:
+      publishCommandAck(requestId, false, "no update needed");
+      break;
+    case HTTP_UPDATE_FAILED:
+    default: {
+      char detail[128];
+      snprintf(detail, sizeof(detail), "update failed: %s", httpUpdate.getLastErrorString().c_str());
+      publishCommandAck(requestId, false, detail);
+      break;
+    }
+  }
 }
 
 void publishSensorData(float waterLevelCm) {
