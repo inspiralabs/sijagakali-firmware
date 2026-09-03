@@ -1,0 +1,8 @@
+# sijagakali-backend (mqtt-collector, sijagakali-ota) needs the full tree.
+user sijagakali-backend
+topic readwrite sijagakali/#
+
+# Every other authenticated user is scoped to its own device namespace by
+# matching its username (%u) against the device_id segment of the topic.
+# A device logging in as "node-001" can only read/write sijagakali/node-001/#.
+pattern readwrite sijagakali/%u/#

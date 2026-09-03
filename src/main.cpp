@@ -18,7 +18,14 @@
 // "listener 1773 / protocol websockets" (see mosquitto-conf/mosquitto.conf).
 // No port needed here: Cloudflare Tunnel serves this on the standard 443,
 // the internal 1773 is only used between cloudflared and mosquitto locally.
+// For a quick bench test without a tunnel: point this at the broker's plain
+// listener instead, e.g. "mqtt://192.168.1.X:1883" (same WiFi as the broker).
 #define MQTT_BROKER_URI "wss://YOUR_CLOUDFLARE_HOSTNAME/mqtt"
+
+// ponytail: publish a simulated water level whenever the A01ANY4B doesn't answer
+// (no sensor wired up), so this firmware alone can prove the WiFi->MQTT->backend
+// path works. Set to 0 once a real sensor is always attached.
+#define DUMMY_SENSOR_FALLBACK 1
 // Must equal this device's mosquitto username (see Task 1 Step 1) so the
 // broker's ACL pattern "sijagakali/%u/#" scopes it to its own topics.
 #define MQTT_USER "node-001"
@@ -466,6 +473,7 @@ void loop() {
     for (uint16_t i = 0; i < len; i++) Serial.printf("%02X ", recv_buf[i]);
     Serial.println();
 
+    bool gotReading = false;
     if (len == 7 && recv_buf[1] == 0x03) {
       uint16_t calc_crc = crc16(recv_buf, 7 - 2);
       uint16_t recv_crc = recv_buf[5] << 8 | recv_buf[6];
@@ -483,6 +491,7 @@ void loop() {
           float waterLevelCm = sensorHeightCm - distanceCm;
           if (waterLevelCm < 0) waterLevelCm = 0; // clamp: sensor above dry channel bottom reads as 0, not negative
           publishSensorData(waterLevelCm);
+          gotReading = true;
         } else {
           Serial.println("Below the lower limit");
         }
@@ -490,6 +499,16 @@ void loop() {
         Serial.println("checksum mismatch");
       }
     }
+#if DUMMY_SENSOR_FALLBACK
+    if (!gotReading) {
+      // Slow sine wave + a little noise so the value visibly moves in the dashboard.
+      float dummyLevel = 40.0f + 25.0f * sinf(millis() / 60000.0f) + (float)((int)(esp_random() % 21) - 10) / 10.0f;
+      if (dummyLevel < 0) dummyLevel = 0;
+      Serial.print("No sensor reply -> publishing DUMMY water_level_cm=");
+      Serial.println(dummyLevel);
+      publishSensorData(dummyLevel);
+    }
+#endif
     trigger_cnt = millis();
   }
 
