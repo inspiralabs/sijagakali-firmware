@@ -19,12 +19,9 @@
 // Bench test tanpa VPS: arahkan ke broker lokal (WiFi sama), mis. "mqtt://192.168.1.X:1883".
 #define MQTT_BROKER_URI "wss://mqtt-sijagakali.inspiralabs.id/mqtt"
 
-// ponytail: publish a simulated water level whenever the A01ANY4B doesn't answer
-// (no sensor wired up), so this firmware alone can prove the WiFi->MQTT->backend
-// path works. Set to 0 once a real sensor is always attached.
-#define DUMMY_SENSOR_FALLBACK 1
-// Must equal this device's mosquitto username (see Task 1 Step 1) so the
-// broker's ACL pattern "sijagakali/%u/#" scopes it to its own topics.
+// Firmware tidak pernah mengarang angka level air. Uji tanpa sensor pakai ../esp32-dummy.
+// Must equal this device's mosquitto username: the broker ACL scopes each device to
+// sijagakali/<username>/... (see sijagakali-api deploy/mosquitto/acl).
 #define MQTT_USER "node-001"
 #define MQTT_PASSWORD "YOUR_DEVICE_MQTT_PASSWORD"
 #define DEPLOYMENT_SLUG "sijagakali-bojong-kulur"
@@ -40,6 +37,15 @@ uint32_t readIntervalSec = READ_INTERVAL_SEC_DEFAULT;
 float lastDistanceCm = 0.0;
 uint32_t lastDistanceAt = 0; // millis() of last successful sensor read; 0 = no reading yet
 uint32_t trigger_cnt_reset_flag = 0;
+
+// A01ANY4B tidak bisa mengukur di bawah 28 cm (zona buta). Sensor dipasang di atas
+// sungai, jadi jarak < 28 cm = air nyaris menyentuh sensor.
+#define SENSOR_BLIND_ZONE_CM 28.0f
+#define SENSOR_READ_ATTEMPTS 3
+// Error sensor terakhir untuk heartbeat (null = sehat) + jumlah siklus gagal berturut-turut.
+const char* sensorError = nullptr;
+char sensorErrorBuf[48];
+uint32_t sensorFailStreak = 0;
 
 // OTA is deferred to loop() rather than run inside the MQTT event callback: esp-mqtt's
 // internal client task has only a 6144-byte stack (too small for TLS handshake +
@@ -332,7 +338,7 @@ void performOtaUpdate(const char* requestId, const char* url) {
   }
 }
 
-void publishSensorData(float waterLevelCm) {
+void publishSensorData(float waterLevelCm, bool blindZone = false) {
   if (!mqttConnected) return;
 
   ensureTimeSynced();
@@ -348,6 +354,7 @@ void publishSensorData(float waterLevelCm) {
   doc["water_level_cm"] = roundf(waterLevelCm * 10) / 10.0f; // 1 decimal, matches dummy publisher precision
   doc["timestamp"] = ts;
   doc["rssi"] = WiFi.RSSI();
+  if (blindZone) doc["blind_zone"] = true; // level = batas bawah (air bisa lebih tinggi)
   // no battery sensor on this board; omit battery_pct (optional field)
 
   char buf[384];
@@ -376,7 +383,8 @@ void publishSensorStatus() {
   doc["online"] = true;
   doc["uptime_sec"] = millis() / 1000;
   doc["firmware_version"] = FIRMWARE_VERSION;
-  doc["last_error"] = nullptr;
+  if (sensorError) doc["last_error"] = sensorError;
+  else doc["last_error"] = nullptr;
   doc["heap_free_bytes"] = ESP.getFreeHeap();
 
   char buf[320];
@@ -386,6 +394,32 @@ void publishSensorStatus() {
   snprintf(topic, sizeof(topic), "%s/sensor/status", topicBase);
   esp_mqtt_client_publish(mqttClient, topic, buf, n, 0, 0);
   Serial.println("Published sensor/status heartbeat");
+}
+
+// Satu permintaan Modbus ke A01ANY4B. nullptr = sukses (*distanceMm terisi), selain itu kode error.
+const char* readSensorOnce(uint16_t* distanceMm) {
+  static uint8_t recv_buf[10] = {0};
+  while (sensorSerial.available()) sensorSerial.read(); // drop stale bytes so the read window aligns with this request's reply
+
+  // 01 03 01 01 00 01 D4 36  read real-time value -> reply: 01 03 02 <hi> <lo> <crc_hi> <crc_lo>
+  uint8_t tx_buf[] = {0x01, 0x03, 0x01, 0x01, 0x00, 0x01, 0xD4, 0x36};
+  sensorSerial.write(tx_buf, sizeof(tx_buf));
+  sensorSerial.flush(); // wait for command to fully transmit
+  delay(20); // let any TX echo settle and the sensor start replying before we read
+  while (sensorSerial.available()) sensorSerial.read(); // drop leftover echo bytes, keep only the fresh reply
+  delay(30); // give the full 7-byte reply time to arrive so readBytes doesn't return a partial frame
+  uint16_t len = sensorSerial.readBytes(recv_buf, 7);
+
+  Serial.printf("raw[%d]: ", len);
+  for (uint16_t i = 0; i < len; i++) Serial.printf("%02X ", recv_buf[i]);
+  Serial.println();
+
+  if (len != 7 || recv_buf[1] != 0x03) return "sensor_no_reply";
+  uint16_t calc_crc = crc16(recv_buf, 7 - 2);
+  uint16_t recv_crc = recv_buf[5] << 8 | recv_buf[6];
+  if (calc_crc != recv_crc) return "sensor_crc";
+  *distanceMm = recv_buf[3] << 8 | recv_buf[4];
+  return nullptr;
 }
 
 void setup() {
@@ -451,61 +485,57 @@ void loop() {
   }
 
   static uint32_t trigger_cnt = 0;
-  static uint8_t recv_buf[10] = {0};
 
   if (millis() - trigger_cnt > (readIntervalSec * 1000UL) || trigger_cnt_reset_flag) {
     trigger_cnt_reset_flag = 0;
-    while (sensorSerial.available()) sensorSerial.read(); // drop stale bytes so the read window aligns with this request's reply
 
-    // 01 03 01 01 00 01 D4 36  read real-time value -> reply: 01 03 02 <hi> <lo> <crc_hi> <crc_lo>
-    uint8_t tx_buf[] = {0x01, 0x03, 0x01, 0x01, 0x00, 0x01, 0xD4, 0x36};
-    sensorSerial.write(tx_buf, sizeof(tx_buf));
-    sensorSerial.flush(); // wait for command to fully transmit
-    delay(20); // let any TX echo settle and the sensor start replying before we read
-    while (sensorSerial.available()) sensorSerial.read(); // drop leftover echo bytes, keep only the fresh reply
-    delay(30); // give the full 7-byte reply time to arrive so readBytes doesn't return a partial frame
-    uint16_t len = sensorSerial.readBytes(recv_buf, 7);
+    // Gangguan UART sesaat sering terjadi: coba beberapa kali sebelum menyatakan gagal.
+    uint16_t distanceMm = 0;
+    const char* err = nullptr;
+    for (int attempt = 1; attempt <= SENSOR_READ_ATTEMPTS; attempt++) {
+      err = readSensorOnce(&distanceMm);
+      if (!err) break;
+      Serial.printf("Sensor gagal (percobaan %d/%d): %s\n", attempt, SENSOR_READ_ATTEMPTS, err);
+      if (attempt < SENSOR_READ_ATTEMPTS) delay(200);
+    }
 
-    Serial.printf("raw[%d]: ", len);
-    for (uint16_t i = 0; i < len; i++) Serial.printf("%02X ", recv_buf[i]);
-    Serial.println();
+    bool wasFailing = sensorError != nullptr;
+    if (!err) {
+      float distanceCm = distanceMm / 10.0f;
+      if (distanceCm > SENSOR_BLIND_ZONE_CM) {
+        lastDistanceCm = distanceCm;
+        lastDistanceAt = millis();
+        Serial.print("Distance = ");
+        Serial.print(distanceCm);
+        Serial.println(" cm");
 
-    bool gotReading = false;
-    if (len == 7 && recv_buf[1] == 0x03) {
-      uint16_t calc_crc = crc16(recv_buf, 7 - 2);
-      uint16_t recv_crc = recv_buf[5] << 8 | recv_buf[6];
-
-      if (calc_crc == recv_crc) {
-        uint16_t distanceMm = recv_buf[3] << 8 | recv_buf[4];
-        if (distanceMm > 280) {
-          float distanceCm = distanceMm / 10.0;
-          lastDistanceCm = distanceCm;
-          lastDistanceAt = millis();
-          Serial.print("Distance = ");
-          Serial.print(distanceCm);
-          Serial.println(" cm");
-
-          float waterLevelCm = sensorHeightCm - distanceCm;
-          if (waterLevelCm < 0) waterLevelCm = 0; // clamp: sensor above dry channel bottom reads as 0, not negative
-          publishSensorData(waterLevelCm);
-          gotReading = true;
-        } else {
-          Serial.println("Below the lower limit");
-        }
+        float waterLevelCm = sensorHeightCm - distanceCm;
+        if (waterLevelCm < 0) waterLevelCm = 0; // clamp: sensor above dry channel bottom reads as 0, not negative
+        publishSensorData(waterLevelCm);
       } else {
-        Serial.println("checksum mismatch");
+        // Zona buta: air (atau benda) < 28 cm dari sensor. Jangan dibuang — laporkan level
+        // minimum yang pasti terlampaui. Alarm palsu lebih aman daripada banjir yang terlewat.
+        float waterLevelCm = sensorHeightCm - SENSOR_BLIND_ZONE_CM;
+        if (waterLevelCm < 0) waterLevelCm = 0;
+        Serial.print("Zona buta sensor -> lapor level minimum ");
+        Serial.print(waterLevelCm);
+        Serial.println(" cm (blind_zone)");
+        publishSensorData(waterLevelCm, true);
       }
+      sensorFailStreak = 0;
+      sensorError = nullptr;
+    } else {
+      // Tidak ada data yang dikirim — server melihat data berhenti + last_error di heartbeat.
+      sensorFailStreak++;
+      snprintf(sensorErrorBuf, sizeof(sensorErrorBuf), "%s x%lu", err, (unsigned long)sensorFailStreak);
+      sensorError = sensorErrorBuf;
     }
-#if DUMMY_SENSOR_FALLBACK
-    if (!gotReading) {
-      // Slow sine wave + a little noise so the value visibly moves in the dashboard.
-      float dummyLevel = 40.0f + 25.0f * sinf(millis() / 60000.0f) + (float)((int)(esp_random() % 21) - 10) / 10.0f;
-      if (dummyLevel < 0) dummyLevel = 0;
-      Serial.print("No sensor reply -> publishing DUMMY water_level_cm=");
-      Serial.println(dummyLevel);
-      publishSensorData(dummyLevel);
+
+    // Kabari server segera saat sensor mulai gagal atau pulih (tidak menunggu heartbeat berikutnya).
+    if (wasFailing != (sensorError != nullptr)) {
+      publishSensorStatus();
+      statusSentAt = millis();
     }
-#endif
     trigger_cnt = millis();
   }
 
