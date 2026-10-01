@@ -14,12 +14,9 @@
 #include "esp_crt_bundle.h"
 
 // --- MQTT ---
-// Public hostname routed through Cloudflare Tunnel to mosquitto's
-// "listener 1773 / protocol websockets" (see mosquitto-conf/mosquitto.conf).
-// Broker mosquitto di VPS (docker compose sijagakali-api), WebSocket di belakang Traefik:
-// TLS diterminasi Traefik di 443, diteruskan ke listener websockets 9001.
-// For a quick bench test without a tunnel: point this at the broker's plain
-// listener instead, e.g. "mqtt://192.168.1.X:1883" (same WiFi as the broker).
+// Broker mosquitto di VPS (docker compose sijagakali-api): WebSocket di belakang Traefik,
+// TLS diterminasi Traefik di 443, diteruskan ke listener websockets mosquitto 9001.
+// Bench test tanpa VPS: arahkan ke broker lokal (WiFi sama), mis. "mqtt://192.168.1.X:1883".
 #define MQTT_BROKER_URI "wss://mqtt-sijagakali.inspiralabs.id/mqtt"
 
 // ponytail: publish a simulated water level whenever the A01ANY4B doesn't answer
