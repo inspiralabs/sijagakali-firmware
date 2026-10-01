@@ -14,10 +14,11 @@
 #include "esp_crt_bundle.h"
 
 // --- MQTT ---
-// Broker mosquitto di VPS (docker compose sijagakali-api): WebSocket di belakang Traefik,
-// TLS diterminasi Traefik di 443, diteruskan ke listener websockets mosquitto 9001.
+// Broker MQTT bersama di VPS (infra mosquitto, /opt/server-setup/infra): MQTT over TLS di 8883,
+// sertifikat Let's Encrypt diverifikasi lewat crt bundle. Akun device dibuat dengan
+// `sudo /opt/server-setup/bin/mqtt-user.sh add <device_id>`.
 // Bench test tanpa VPS: arahkan ke broker lokal (WiFi sama), mis. "mqtt://192.168.1.X:1883".
-#define MQTT_BROKER_URI "wss://mqtt-sijagakali.inspiralabs.id/mqtt"
+#define MQTT_BROKER_URI "mqtts://mqtt.inspiralabs.id:8883"
 
 // Firmware tidak pernah mengarang angka level air. Uji tanpa sensor pakai ../esp32-dummy.
 // Must equal this device's mosquitto username: the broker ACL scopes each device to
@@ -464,7 +465,7 @@ void setup() {
   mqttCfg.credentials.username = MQTT_USER;
   mqttCfg.credentials.authentication.password = MQTT_PASSWORD;
   mqttCfg.credentials.client_id = mqttClientId;
-  mqttCfg.session.keepalive = 45; // stay well under Cloudflare's free-tier ~100s idle websocket timeout
+  mqttCfg.session.keepalive = 45; // cepat mendeteksi koneksi 4G putus, aman untuk NAT operator
   mqttCfg.buffer.size = 512; // default 256 is too small for sensor/data + status JSON
 
   mqttClient = esp_mqtt_client_init(&mqttCfg);
