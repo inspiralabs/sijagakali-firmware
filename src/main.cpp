@@ -14,25 +14,34 @@
 #include "esp_crt_bundle.h"
 
 // --- MQTT ---
-// Broker mosquitto di VPS (docker compose sijagakali-api): WebSocket di belakang Traefik,
-// TLS diterminasi Traefik di 443, diteruskan ke listener websockets mosquitto 9001.
+// Broker MQTT bersama di VPS (infra mosquitto, /opt/server-setup/infra): MQTT over TLS di 8883,
+// sertifikat Let's Encrypt diverifikasi lewat crt bundle. Akun device dibuat dengan
+// `sudo /opt/server-setup/bin/mqtt-user.sh add <device_id>`.
 // Bench test tanpa VPS: arahkan ke broker lokal (WiFi sama), mis. "mqtt://192.168.1.X:1883".
-#define MQTT_BROKER_URI "wss://mqtt-sijagakali.inspiralabs.id/mqtt"
+#define MQTT_BROKER_URI "mqtts://mqtt.inspiralabs.id:8883"
 
 // Firmware tidak pernah mengarang angka level air. Uji tanpa sensor pakai ../esp32-dummy.
 // Must equal this device's mosquitto username: the broker ACL scopes each device to
-// sijagakali/<username>/... (see sijagakali-api deploy/mosquitto/acl).
+// sijagakali/<username>/... (VPS: /srv/infra/mosquitto/auth/acl).
 #define MQTT_USER "node-001"
 #define MQTT_PASSWORD "YOUR_DEVICE_MQTT_PASSWORD"
 #define DEPLOYMENT_SLUG "sijagakali-bojong-kulur"
 #define DEVICE_ID "node-001"
 
 // --- Runtime-mutable config (defaults; can be changed via MQTT command/config) ---
-#define SENSOR_HEIGHT_CM_DEFAULT 150.0  // distance from sensor to dry-channel bottom; calibrate per install site
-#define READ_INTERVAL_SEC_DEFAULT 30
+#define SENSOR_HEIGHT_CM_DEFAULT 600.0  // distance from sensor to dry-channel bottom; calibrate per install site
+// readIntervalSec (diatur dari web) = jeda MAKSIMAL antar kiriman sensor/data.
+// Sensor tetap dibaca tiap SENSOR_POLL_SEC; perubahan >= SEND_DELTA_CM dikirim saat itu juga.
+#define READ_INTERVAL_SEC_DEFAULT 3600 // sama dengan default device_configs.read_interval_sec
+#define SENSOR_POLL_SEC 30
+#define SEND_DELTA_CM 10.0f // naikkan jika pembacaan di lokasi sering naik-turun sendiri
 
 float sensorHeightCm = SENSOR_HEIGHT_CM_DEFAULT;
 uint32_t readIntervalSec = READ_INTERVAL_SEC_DEFAULT;
+
+float lastSentLevelCm = 0.0;
+bool lastSentBlindZone = false;
+uint32_t lastSentAt = 0; // millis() kiriman sensor/data terakhir yang berhasil; 0 = belum pernah
 
 float lastDistanceCm = 0.0;
 uint32_t lastDistanceAt = 0; // millis() of last successful sensor read; 0 = no reading yet
@@ -61,7 +70,7 @@ Preferences prefs;
 #define STATUS_INTERVAL_SEC_DEFAULT 120
 uint32_t statusIntervalSec = STATUS_INTERVAL_SEC_DEFAULT;
 uint32_t statusSentAt = 0;
-#define FIRMWARE_VERSION "sijagakali-v1.0.0"
+#define FIRMWARE_VERSION "sijagakali-v1.2.0"
 
 esp_mqtt_client_handle_t mqttClient = nullptr;
 volatile bool mqttConnected = false;
@@ -276,10 +285,12 @@ void syncTimeWib() {
   Serial.println();
 }
 
+bool timeSynced() {
+  return time(nullptr) >= 1600000000; // below = NTP never synced (or WiFi wasn't up in setup())
+}
+
 void ensureTimeSynced() {
-  if (time(nullptr) < 1600000000) { // implausible epoch: NTP never synced (or WiFi wasn't up in setup())
-    syncTimeWib();
-  }
+  if (!timeSynced()) syncTimeWib();
 }
 
 void isoTimestampWib(char out[26]) {
@@ -306,7 +317,7 @@ void publishCommandAck(const char* requestId, bool ok, const char* detail) {
 
   char topic[128];
   snprintf(topic, sizeof(topic), "%s/command/ack", topicBase);
-  esp_mqtt_client_publish(mqttClient, topic, buf, n, 0, 0); // qos=0, retain=0 — same as before
+  esp_mqtt_client_publish(mqttClient, topic, buf, n, 1, 0); // qos=1: OTA history depends on this ack
 }
 
 void performOtaUpdate(const char* requestId, const char* url) {
@@ -338,10 +349,16 @@ void performOtaUpdate(const char* requestId, const char* url) {
   }
 }
 
-void publishSensorData(float waterLevelCm, bool blindZone = false) {
-  if (!mqttConnected) return;
+// true = diserahkan ke client MQTT (qos 1). false = dilewati, dicoba lagi di pembacaan berikutnya.
+bool publishSensorData(float waterLevelCm, bool blindZone = false) {
+  if (!mqttConnected) return false;
 
   ensureTimeSynced();
+  // Jam belum sinkron = timestamp 1970 -> recorded_at salah. Lewati; data berikutnya dicoba lagi.
+  if (!timeSynced()) {
+    Serial.println("sensor/data dilewati: waktu NTP belum sinkron");
+    return false;
+  }
   char corrId[37];
   generateUuidV4(corrId);
   char ts[26];
@@ -362,24 +379,42 @@ void publishSensorData(float waterLevelCm, bool blindZone = false) {
 
   char topic[128];
   snprintf(topic, sizeof(topic), "%s/sensor/data", topicBase);
-  int msgId = esp_mqtt_client_publish(mqttClient, topic, buf, n, 0, 0);
+  int msgId = esp_mqtt_client_publish(mqttClient, topic, buf, n, 1, 0); // qos=1: retransmit if the link blips
 
   Serial.print("Published sensor/data: ");
   Serial.print(buf);
   Serial.println(msgId >= 0 ? " [ok]" : " [FAILED]");
+  return msgId >= 0;
+}
+
+// Kirim jika: belum pernah, diminta (sample_now), berubah >= SEND_DELTA_CM (naik/turun),
+// masuk/keluar zona buta, atau sudah readIntervalSec sejak kiriman terakhir.
+void maybePublishSensorData(float waterLevelCm, bool blindZone, bool forced) {
+  bool due = lastSentAt == 0 || forced
+    || fabsf(waterLevelCm - lastSentLevelCm) >= SEND_DELTA_CM
+    || blindZone != lastSentBlindZone
+    || millis() - lastSentAt >= readIntervalSec * 1000UL;
+  if (!due) return;
+  if (publishSensorData(waterLevelCm, blindZone)) {
+    lastSentLevelCm = waterLevelCm;
+    lastSentBlindZone = blindZone;
+    lastSentAt = millis();
+  }
 }
 
 void publishSensorStatus() {
   if (!mqttConnected) return;
 
   ensureTimeSynced();
-  char ts[26];
-  isoTimestampWib(ts);
 
   JsonDocument doc;
   doc["deployment_slug"] = DEPLOYMENT_SLUG;
   doc["device_id"] = DEVICE_ID;
-  doc["timestamp"] = ts;
+  if (timeSynced()) { // tanpa timestamp, collector memakai jam server untuk last_seen_at
+    char ts[26];
+    isoTimestampWib(ts);
+    doc["timestamp"] = ts;
+  }
   doc["online"] = true;
   doc["uptime_sec"] = millis() / 1000;
   doc["firmware_version"] = FIRMWARE_VERSION;
@@ -464,7 +499,7 @@ void setup() {
   mqttCfg.credentials.username = MQTT_USER;
   mqttCfg.credentials.authentication.password = MQTT_PASSWORD;
   mqttCfg.credentials.client_id = mqttClientId;
-  mqttCfg.session.keepalive = 45; // stay well under Cloudflare's free-tier ~100s idle websocket timeout
+  mqttCfg.session.keepalive = 45; // cepat mendeteksi koneksi 4G putus, aman untuk NAT operator
   mqttCfg.buffer.size = 512; // default 256 is too small for sensor/data + status JSON
 
   mqttClient = esp_mqtt_client_init(&mqttCfg);
@@ -486,7 +521,10 @@ void loop() {
 
   static uint32_t trigger_cnt = 0;
 
-  if (millis() - trigger_cnt > (readIntervalSec * 1000UL) || trigger_cnt_reset_flag) {
+  // Poll tidak boleh lebih jarang dari interval kirim (web mengizinkan interval minimal 10 s).
+  uint32_t pollSec = readIntervalSec < SENSOR_POLL_SEC ? readIntervalSec : SENSOR_POLL_SEC;
+  if (millis() - trigger_cnt > (pollSec * 1000UL) || trigger_cnt_reset_flag) {
+    bool forced = trigger_cnt_reset_flag;
     trigger_cnt_reset_flag = 0;
 
     // Gangguan UART sesaat sering terjadi: coba beberapa kali sebelum menyatakan gagal.
@@ -511,7 +549,7 @@ void loop() {
 
         float waterLevelCm = sensorHeightCm - distanceCm;
         if (waterLevelCm < 0) waterLevelCm = 0; // clamp: sensor above dry channel bottom reads as 0, not negative
-        publishSensorData(waterLevelCm);
+        maybePublishSensorData(waterLevelCm, false, forced);
       } else {
         // Zona buta: air (atau benda) < 28 cm dari sensor. Jangan dibuang — laporkan level
         // minimum yang pasti terlampaui. Alarm palsu lebih aman daripada banjir yang terlewat.
@@ -520,7 +558,7 @@ void loop() {
         Serial.print("Zona buta sensor -> lapor level minimum ");
         Serial.print(waterLevelCm);
         Serial.println(" cm (blind_zone)");
-        publishSensorData(waterLevelCm, true);
+        maybePublishSensorData(waterLevelCm, true, forced);
       }
       sensorFailStreak = 0;
       sensorError = nullptr;
