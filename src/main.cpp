@@ -36,6 +36,13 @@
 #define SENSOR_POLL_SEC 30
 #define SEND_DELTA_CM 10.0f // naikkan jika pembacaan di lokasi sering naik-turun sendiri
 
+// Mode dev (env:dev di platformio.ini): uji sensor saja, dibaca tiap DEV_POLL_MS.
+// WiFi/MQTT tidak pernah dinyalakan, jadi tidak ada data ke server. Build biasa = produksi.
+#ifndef DEV_MODE
+#define DEV_MODE 0
+#endif
+#define DEV_POLL_MS 500
+
 float sensorHeightCm = SENSOR_HEIGHT_CM_DEFAULT;
 uint32_t readIntervalSec = READ_INTERVAL_SEC_DEFAULT;
 
@@ -51,6 +58,11 @@ uint32_t trigger_cnt_reset_flag = 0;
 // sungai, jadi jarak < 28 cm = air nyaris menyentuh sensor.
 #define SENSOR_BLIND_ZONE_CM 28.0f
 #define SENSOR_READ_ATTEMPTS 3
+// Bacaan valid terakhir <= NEAR_TOP_CM dari sensor lalu sensor gagal/jarak 0 = air atau pelampung
+// kemungkinan menutupi/merendam sensor -> laporkan zona buta, jangan diam. Air tidak bisa naik dari
+// jauh sampai menutupi sensor dalam satu siklus 30 s. Sesuaikan setelah uji lapangan.
+#define NEAR_TOP_CM 80.0f
+bool nearTop = false; // disimpan di flash: reboot saat banjir tidak boleh membuat device diam
 // Error sensor terakhir untuk heartbeat (null = sehat) + jumlah siklus gagal berturut-turut.
 const char* sensorError = nullptr;
 char sensorErrorBuf[48];
@@ -70,7 +82,7 @@ Preferences prefs;
 #define STATUS_INTERVAL_SEC_DEFAULT 120
 uint32_t statusIntervalSec = STATUS_INTERVAL_SEC_DEFAULT;
 uint32_t statusSentAt = 0;
-#define FIRMWARE_VERSION "sijagakali-v1.2.0"
+#define FIRMWARE_VERSION "sijagakali-v1.2.1"
 
 esp_mqtt_client_handle_t mqttClient = nullptr;
 volatile bool mqttConnected = false;
@@ -454,6 +466,9 @@ const char* readSensorOnce(uint16_t* distanceMm) {
   uint16_t recv_crc = recv_buf[5] << 8 | recv_buf[6];
   if (calc_crc != recv_crc) return "sensor_crc";
   *distanceMm = recv_buf[3] << 8 | recv_buf[4];
+  // 0 = pantulan tidak kembali (ruang terbuka / pelampung hilang), bukan zona buta:
+  // benda di zona buta tetap terbaca > 0 (uji bangku: benda dekat sensor -> 250 mm).
+  if (*distanceMm == 0) return "sensor_no_echo";
   return nullptr;
 }
 
@@ -469,6 +484,12 @@ void setup() {
   prefs.begin("sijagakali", false);
   sensorHeightCm = prefs.getFloat("sensorH", SENSOR_HEIGHT_CM_DEFAULT);
   readIntervalSec = prefs.getUInt("interval", READ_INTERVAL_SEC_DEFAULT);
+  nearTop = prefs.getBool("nearTop", false);
+
+  if (DEV_MODE) {
+    Serial.println("=== MODE DEV: uji sensor saja, WiFi/MQTT mati, tidak kirim ke server ===");
+    return;
+  }
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -512,7 +533,7 @@ void setup() {
 }
 
 void loop() {
-  ensureWifi();
+  if (!DEV_MODE) ensureWifi();
 
   if (otaUpdatePending) {
     otaUpdatePending = false;
@@ -523,7 +544,8 @@ void loop() {
 
   // Poll tidak boleh lebih jarang dari interval kirim (web mengizinkan interval minimal 10 s).
   uint32_t pollSec = readIntervalSec < SENSOR_POLL_SEC ? readIntervalSec : SENSOR_POLL_SEC;
-  if (millis() - trigger_cnt > (pollSec * 1000UL) || trigger_cnt_reset_flag) {
+  uint32_t pollMs = DEV_MODE ? DEV_POLL_MS : pollSec * 1000UL;
+  if (millis() - trigger_cnt > pollMs || trigger_cnt_reset_flag) {
     bool forced = trigger_cnt_reset_flag;
     trigger_cnt_reset_flag = 0;
 
@@ -540,6 +562,11 @@ void loop() {
     bool wasFailing = sensorError != nullptr;
     if (!err) {
       float distanceCm = distanceMm / 10.0f;
+      bool near = distanceCm <= NEAR_TOP_CM;
+      if (near != nearTop) {
+        nearTop = near;
+        prefs.putBool("nearTop", near); // hanya saat berubah, flash tidak cepat aus
+      }
       if (distanceCm > SENSOR_BLIND_ZONE_CM) {
         lastDistanceCm = distanceCm;
         lastDistanceAt = millis();
@@ -562,6 +589,16 @@ void loop() {
       }
       sensorFailStreak = 0;
       sensorError = nullptr;
+    } else if (nearTop) {
+      // Air terakhir dekat sensor: gagal baca kemungkinan karena sensor tertutup/terendam air.
+      // Laporkan zona buta agar alarm tetap jalan; last_error memberi tahu operator level ini dugaan.
+      sensorFailStreak++;
+      float waterLevelCm = sensorHeightCm - SENSOR_BLIND_ZONE_CM;
+      if (waterLevelCm < 0) waterLevelCm = 0;
+      Serial.println("Sensor gagal saat air dekat sensor -> anggap zona buta");
+      maybePublishSensorData(waterLevelCm, true, forced);
+      snprintf(sensorErrorBuf, sizeof(sensorErrorBuf), "%s x%lu -> blind_zone", err, (unsigned long)sensorFailStreak);
+      sensorError = sensorErrorBuf;
     } else {
       // Tidak ada data yang dikirim — server melihat data berhenti + last_error di heartbeat.
       sensorFailStreak++;
