@@ -46,9 +46,33 @@
 float sensorHeightCm = SENSOR_HEIGHT_CM_DEFAULT;
 uint32_t readIntervalSec = READ_INTERVAL_SEC_DEFAULT;
 
+// Bacaan terakhir yang masuk antrean kirim (dasar keputusan "perlu dikirim").
 float lastSentLevelCm = 0.0;
 bool lastSentBlindZone = false;
-uint32_t lastSentAt = 0; // millis() kiriman sensor/data terakhir yang berhasil; 0 = belum pernah
+uint32_t lastSentAt = 0; // millis(); 0 = belum pernah
+
+// --- Simpan lalu kirim (store & forward) ---
+// Bacaan yang perlu dikirim masuk antrean RAM dengan timestamp & correlation_id-nya sendiri, lalu
+// dikirim berurutan (terlama dulu). Dihapus dari antrean hanya setelah broker membalas PUBACK;
+// tanpa balasan dalam ACK_TIMEOUT_MS -> kirim ulang dengan correlation_id sama (server menolak dobel).
+// PUBACK = broker sudah menerima; broker (sesi persisten collector) menahan pesan sampai collector
+// selesai menyimpan ke DB/spool, dan mengirim ulang bila collector restart sebelum itu.
+// ponytail: antrean di RAM, hilang saat restart/listrik mati; pindah ke partisi flash (perlu flash USB) bila itu jadi masalah.
+#define PENDING_MAX 500       // ±25 KB; 1 data/jam = ±20 hari, banjir ±10 data/jam = ±2 hari
+#define ACK_TIMEOUT_MS 30000
+struct PendingReading {
+  char corrId[37];
+  time_t ts;
+  float levelCm;
+  int8_t rssi;
+  bool blindZone;
+};
+PendingReading pending[PENDING_MAX];
+uint16_t pendingHead = 0, pendingCount = 0;
+// Ditulis task esp-mqtt (MQTT_EVENT_PUBLISHED), dibaca loop().
+volatile int inflightMsgId = -1;
+volatile bool inflightConfirmed = false;
+uint32_t inflightSentAt = 0; // millis() head antrean dikirim; 0 = tidak ada yang menunggu PUBACK
 
 float lastDistanceCm = 0.0;
 uint32_t lastDistanceAt = 0; // millis() of last successful sensor read; 0 = no reading yet
@@ -82,7 +106,7 @@ Preferences prefs;
 #define STATUS_INTERVAL_SEC_DEFAULT 120
 uint32_t statusIntervalSec = STATUS_INTERVAL_SEC_DEFAULT;
 uint32_t statusSentAt = 0;
-#define FIRMWARE_VERSION "sijagakali-v1.2.1"
+#define FIRMWARE_VERSION "sijagakali-v1.3.0"
 
 esp_mqtt_client_handle_t mqttClient = nullptr;
 volatile bool mqttConnected = false;
@@ -174,6 +198,9 @@ static void mqttEventHandler(void* handler_args, esp_event_base_t base, int32_t 
     case MQTT_EVENT_DISCONNECTED:
       mqttConnected = false;
       Serial.println("MQTT: disconnected");
+      break;
+    case MQTT_EVENT_PUBLISHED: // PUBACK: broker sudah menerima dan menahan pesan untuk collector
+      if (event->msg_id == inflightMsgId) inflightConfirmed = true;
       break;
     case MQTT_EVENT_DATA: {
       // Our JSON payloads are always well under the buffer size, so a message
@@ -305,10 +332,9 @@ void ensureTimeSynced() {
   if (!timeSynced()) syncTimeWib();
 }
 
-void isoTimestampWib(char out[26]) {
-  time_t now = time(nullptr);
+void isoTimestampWib(char out[26], time_t when = time(nullptr)) {
   struct tm t;
-  localtime_r(&now, &t);
+  localtime_r(&when, &t);
   snprintf(out, 26, "%04d-%02d-%02dT%02d:%02d:%02d+07:00",
     t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
 }
@@ -361,29 +387,18 @@ void performOtaUpdate(const char* requestId, const char* url) {
   }
 }
 
-// true = diserahkan ke client MQTT (qos 1). false = dilewati, dicoba lagi di pembacaan berikutnya.
-bool publishSensorData(float waterLevelCm, bool blindZone = false) {
-  if (!mqttConnected) return false;
-
-  ensureTimeSynced();
-  // Jam belum sinkron = timestamp 1970 -> recorded_at salah. Lewati; data berikutnya dicoba lagi.
-  if (!timeSynced()) {
-    Serial.println("sensor/data dilewati: waktu NTP belum sinkron");
-    return false;
-  }
-  char corrId[37];
-  generateUuidV4(corrId);
+void publishReading(const PendingReading& r) {
   char ts[26];
-  isoTimestampWib(ts);
+  isoTimestampWib(ts, r.ts); // waktu pengukuran, bukan waktu kirim (data susulan tetap di jam aslinya)
 
   JsonDocument doc;
   doc["deployment_slug"] = DEPLOYMENT_SLUG;
   doc["device_id"] = DEVICE_ID;
-  doc["correlation_id"] = corrId;
-  doc["water_level_cm"] = roundf(waterLevelCm * 10) / 10.0f; // 1 decimal, matches dummy publisher precision
+  doc["correlation_id"] = r.corrId;
+  doc["water_level_cm"] = roundf(r.levelCm * 10) / 10.0f; // 1 decimal, matches dummy publisher precision
   doc["timestamp"] = ts;
-  doc["rssi"] = WiFi.RSSI();
-  if (blindZone) doc["blind_zone"] = true; // level = batas bawah (air bisa lebih tinggi)
+  doc["rssi"] = r.rssi;
+  if (r.blindZone) doc["blind_zone"] = true; // level = batas bawah (air bisa lebih tinggi)
   // no battery sensor on this board; omit battery_pct (optional field)
 
   char buf[384];
@@ -391,15 +406,31 @@ bool publishSensorData(float waterLevelCm, bool blindZone = false) {
 
   char topic[128];
   snprintf(topic, sizeof(topic), "%s/sensor/data", topicBase);
-  int msgId = esp_mqtt_client_publish(mqttClient, topic, buf, n, 1, 0); // qos=1: retransmit if the link blips
+  inflightMsgId = -1; // PUBACK pesan sebelumnya yang terlambat tidak boleh mengonfirmasi pesan ini
+  inflightConfirmed = false;
+  int msgId = esp_mqtt_client_publish(mqttClient, topic, buf, n, 1, 0);
+  inflightMsgId = msgId;
+  inflightSentAt = millis() | 1; // gagal publish (-1) = tunggu ACK_TIMEOUT_MS lalu coba lagi
 
-  Serial.print("Published sensor/data: ");
-  Serial.print(buf);
-  Serial.println(msgId >= 0 ? " [ok]" : " [FAILED]");
-  return msgId >= 0;
+  Serial.printf("Published sensor/data (antrean %u): %s%s\n", pendingCount, buf, msgId >= 0 ? "" : " [FAILED]");
 }
 
-// Kirim jika: belum pernah, diminta (sample_now), berubah >= SEND_DELTA_CM (naik/turun),
+// Hapus head yang sudah di-PUBACK, lalu kirim head berikutnya / kirim ulang yang kedaluwarsa.
+void pumpPending() {
+  if (inflightSentAt != 0 && inflightConfirmed) {
+    pendingHead = (pendingHead + 1) % PENDING_MAX;
+    pendingCount--;
+    inflightSentAt = 0;
+  }
+  if (!mqttConnected || pendingCount == 0) return;
+  if (inflightSentAt != 0) {
+    if (millis() - inflightSentAt < ACK_TIMEOUT_MS) return;
+    Serial.println("sensor/data belum dikonfirmasi broker, kirim ulang");
+  }
+  publishReading(pending[pendingHead]);
+}
+
+// Masuk antrean jika: belum pernah, diminta (sample_now), berubah >= SEND_DELTA_CM (naik/turun),
 // masuk/keluar zona buta, atau sudah readIntervalSec sejak kiriman terakhir.
 void maybePublishSensorData(float waterLevelCm, bool blindZone, bool forced) {
   bool due = lastSentAt == 0 || forced
@@ -407,11 +438,31 @@ void maybePublishSensorData(float waterLevelCm, bool blindZone, bool forced) {
     || blindZone != lastSentBlindZone
     || millis() - lastSentAt >= readIntervalSec * 1000UL;
   if (!due) return;
-  if (publishSensorData(waterLevelCm, blindZone)) {
-    lastSentLevelCm = waterLevelCm;
-    lastSentBlindZone = blindZone;
-    lastSentAt = millis();
+
+  ensureTimeSynced();
+  // Jam belum sinkron = timestamp 1970 -> recorded_at salah. Lewati; pembacaan berikutnya dicoba lagi.
+  if (!timeSynced()) {
+    Serial.println("sensor/data dilewati: waktu NTP belum sinkron");
+    return;
   }
+
+  if (pendingCount == PENDING_MAX) { // penuh: buang yang terlama, data terbaru lebih penting
+    pendingHead = (pendingHead + 1) % PENDING_MAX;
+    pendingCount--;
+    inflightSentAt = 0; // yang dibuang mungkin sedang menunggu PUBACK; head baru dikirim dari awal
+    inflightMsgId = -1;
+  }
+  PendingReading& r = pending[(pendingHead + pendingCount) % PENDING_MAX];
+  generateUuidV4(r.corrId);
+  r.ts = time(nullptr);
+  r.levelCm = waterLevelCm;
+  r.rssi = (int8_t)WiFi.RSSI();
+  r.blindZone = blindZone;
+  pendingCount++;
+
+  lastSentLevelCm = waterLevelCm;
+  lastSentBlindZone = blindZone;
+  lastSentAt = millis();
 }
 
 void publishSensorStatus() {
@@ -433,8 +484,9 @@ void publishSensorStatus() {
   if (sensorError) doc["last_error"] = sensorError;
   else doc["last_error"] = nullptr;
   doc["heap_free_bytes"] = ESP.getFreeHeap();
+  doc["pending_readings"] = pendingCount; // > 0 lama = data tertahan di device, belum sampai server
 
-  char buf[320];
+  char buf[384]; // status + last_error + pending_readings
   size_t n = serializeJson(doc, buf, sizeof(buf));
 
   char topic[128];
@@ -613,6 +665,8 @@ void loop() {
     }
     trigger_cnt = millis();
   }
+
+  if (!DEV_MODE) pumpPending();
 
   static uint32_t led_cnt = millis();
   if (millis() - led_cnt > 100) {
