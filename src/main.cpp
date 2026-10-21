@@ -531,7 +531,10 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   sensorSerial.begin(9600, SERIAL_8N1, SENSOR_RX, SENSOR_TX);
 
-  Serial.println("=== A01ANY4B Modbus RTU sensor starting ===");
+  Serial.println("=== SiJagaKali by InspiraLabs ===");
+  Serial.printf("Firmware   : %s\n", FIRMWARE_VERSION);
+  Serial.printf("Deployment : %s\n", DEPLOYMENT_SLUG);
+  Serial.printf("Device ID  : %s\n", DEVICE_ID);
 
   prefs.begin("sijagakali", false);
   sensorHeightCm = prefs.getFloat("sensorH", SENSOR_HEIGHT_CM_DEFAULT);
