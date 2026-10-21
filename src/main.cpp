@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <time.h>
 #include <Preferences.h>
+#include <string_view>
 
 // --- WiFi ---
 #define WIFI_SSID "YOUR_WIFI_SSID"
@@ -42,6 +43,12 @@
 #define DEV_MODE 0
 #endif
 #define DEV_POLL_MS 500
+
+// Binary produksi dengan kredensial placeholder tidak bisa connect setelah OTA, dan device harus
+// di-flash ulang lewat USB di lokasi. Build-nya digagalkan di sini, bukan ketahuan di lapangan.
+static_assert(DEV_MODE || std::string_view(WIFI_SSID) != "YOUR_WIFI_SSID", "isi WIFI_SSID sebelum build produksi");
+static_assert(DEV_MODE || std::string_view(WIFI_PASSWORD) != "YOUR_WIFI_PASSWORD", "isi WIFI_PASSWORD sebelum build produksi");
+static_assert(DEV_MODE || std::string_view(MQTT_PASSWORD) != "YOUR_DEVICE_MQTT_PASSWORD", "isi MQTT_PASSWORD sebelum build produksi");
 
 float sensorHeightCm = SENSOR_HEIGHT_CM_DEFAULT;
 uint32_t readIntervalSec = READ_INTERVAL_SEC_DEFAULT;
