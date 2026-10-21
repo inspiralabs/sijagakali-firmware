@@ -106,7 +106,7 @@ Preferences prefs;
 #define STATUS_INTERVAL_SEC_DEFAULT 120
 uint32_t statusIntervalSec = STATUS_INTERVAL_SEC_DEFAULT;
 uint32_t statusSentAt = 0;
-#define FIRMWARE_VERSION "sijagakali-v1.3.1"
+#define FIRMWARE_VERSION "sijagakali-v1.3.2"
 
 esp_mqtt_client_handle_t mqttClient = nullptr;
 volatile bool mqttConnected = false;
@@ -178,7 +178,8 @@ void ensureWifi() {
 }
 
 void mqttCallback(const char* topicStr, const uint8_t* payload, size_t length); // forward decl
-void publishCommandAck(const char* requestId, bool ok, const char* detail); // forward decl
+// done=false: progress report; the server keeps the request open (status in_progress)
+void publishCommandAck(const char* requestId, bool ok, const char* detail, bool done = true); // forward decl
 void performOtaUpdate(const char* requestId, const char* url); // forward decl, defined below, invoked from loop() (not from mqttCallback)
 
 static void mqttEventHandler(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data) {
@@ -291,6 +292,7 @@ void mqttCallback(const char* topicStr, const uint8_t* payload, size_t length) {
         strncpy(otaUpdateRequestId, requestId, sizeof(otaUpdateRequestId) - 1);
         otaUpdateRequestId[sizeof(otaUpdateRequestId) - 1] = '\0';
         otaUpdatePending = true; // actual update runs from loop(), not here — see globals above
+        publishCommandAck(requestId, true, "received, starting download", false);
       }
     } else {
       publishCommandAck(requestId, false, "unknown cmd");
@@ -339,13 +341,14 @@ void isoTimestampWib(char out[26], time_t when = time(nullptr)) {
     t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
 }
 
-void publishCommandAck(const char* requestId, bool ok, const char* detail) {
+void publishCommandAck(const char* requestId, bool ok, const char* detail, bool done) {
   if (!mqttConnected) return;
 
   JsonDocument doc;
   doc["request_id"] = requestId;
   doc["ok"] = ok;
   doc["detail"] = detail;
+  if (!done) doc["done"] = false; // omitted on final acks: older servers treat every ack as final
   char ts[26];
   isoTimestampWib(ts);
   doc["timestamp"] = ts;
@@ -366,6 +369,17 @@ void performOtaUpdate(const char* requestId, const char* url) {
   client.setInsecure(); // trust the URL supplied via MQTT command; no fixed CA to pin against
 
   httpUpdate.rebootOnUpdate(false); // let us ack over MQTT before rebooting, same pattern as "restart"
+  // Report every 10% so the dashboard shows progress. Runs inside update() only, so the
+  // reference to the local lastPct never outlives this call.
+  int lastPct = -10;
+  httpUpdate.onProgress([&](int cur, int total) {
+    int pct = total > 0 ? (int)((int64_t)cur * 100 / total) : 0;
+    if (pct < lastPct + 10) return;
+    lastPct = pct;
+    char detail[32];
+    snprintf(detail, sizeof(detail), "downloading %d%%", pct);
+    publishCommandAck(requestId, true, detail, false);
+  });
   t_httpUpdate_return result = httpUpdate.update(client, url);
 
   switch (result) {
@@ -576,6 +590,9 @@ void setup() {
   mqttCfg.credentials.authentication.password = MQTT_PASSWORD;
   mqttCfg.credentials.client_id = mqttClientId;
   mqttCfg.session.keepalive = 45; // cepat mendeteksi koneksi 4G putus, aman untuk NAT operator
+  // Sesi persisten (client_id tetap): broker menyimpan perintah QoS 1 (mis. ota_update) yang
+  // dikirim saat koneksi putus, lalu mengirimkannya begitu device tersambung lagi.
+  mqttCfg.session.disable_clean_session = true;
   mqttCfg.buffer.size = 512; // default 256 is too small for sensor/data + status JSON
 
   mqttClient = esp_mqtt_client_init(&mqttCfg);
@@ -591,8 +608,10 @@ void loop() {
   if (!DEV_MODE) ensureWifi();
 
   if (otaUpdatePending) {
-    otaUpdatePending = false;
     performOtaUpdate(otaUpdateRequestId, otaUpdateUrl);
+    // Cleared only after the update: while it runs, a second ota_update is refused instead of
+    // overwriting otaUpdateRequestId/otaUpdateUrl mid-download. On success the device reboots.
+    otaUpdatePending = false;
   }
 
   static uint32_t trigger_cnt = 0;
