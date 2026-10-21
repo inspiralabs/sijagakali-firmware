@@ -106,7 +106,7 @@ Preferences prefs;
 #define STATUS_INTERVAL_SEC_DEFAULT 120
 uint32_t statusIntervalSec = STATUS_INTERVAL_SEC_DEFAULT;
 uint32_t statusSentAt = 0;
-#define FIRMWARE_VERSION "sijagakali-v1.3.0"
+#define FIRMWARE_VERSION "sijagakali-v1.3.1"
 
 esp_mqtt_client_handle_t mqttClient = nullptr;
 volatile bool mqttConnected = false;
