@@ -71,6 +71,8 @@ struct PendingReading {
   char corrId[37];
   time_t ts;
   float levelCm;
+  float distanceCm;     // jarak mentah sensor untuk cross-check; NAN = tidak ada bacaan (dugaan zona buta)
+  float sensorHeightCm; // tinggi sensor saat pengukuran: level = tinggi - jarak (sebelum di-clamp)
   int8_t rssi;
   bool blindZone;
 };
@@ -113,7 +115,7 @@ Preferences prefs;
 #define STATUS_INTERVAL_SEC_DEFAULT 120
 uint32_t statusIntervalSec = STATUS_INTERVAL_SEC_DEFAULT;
 uint32_t statusSentAt = 0;
-#define FIRMWARE_VERSION "sijagakali-v1.3.3"
+#define FIRMWARE_VERSION "sijagakali-v1.3.4"
 
 esp_mqtt_client_handle_t mqttClient = nullptr;
 volatile bool mqttConnected = false;
@@ -424,6 +426,8 @@ void publishReading(const PendingReading& r) {
   doc["correlation_id"] = r.corrId;
   doc["water_level_cm"] = roundf(r.levelCm * 10) / 10.0f; // 1 decimal, matches dummy publisher precision
   doc["timestamp"] = ts;
+  if (!isnan(r.distanceCm)) doc["distance_cm"] = roundf(r.distanceCm * 10) / 10.0f;
+  doc["sensor_height_cm"] = roundf(r.sensorHeightCm * 10) / 10.0f;
   doc["rssi"] = r.rssi;
   if (r.blindZone) doc["blind_zone"] = true; // level = batas bawah (air bisa lebih tinggi)
   // no battery sensor on this board; omit battery_pct (optional field)
@@ -459,7 +463,7 @@ void pumpPending() {
 
 // Masuk antrean jika: belum pernah, diminta (sample_now), berubah >= SEND_DELTA_CM (naik/turun),
 // masuk/keluar zona buta, atau sudah readIntervalSec sejak kiriman terakhir.
-void maybePublishSensorData(float waterLevelCm, bool blindZone, bool forced) {
+void maybePublishSensorData(float waterLevelCm, float distanceCm, bool blindZone, bool forced) {
   if (DEV_MODE) return; // WiFi mati: tidak ada yang dikirim, jangan antre atau tunggu NTP
   bool due = lastSentAt == 0 || forced
     || fabsf(waterLevelCm - lastSentLevelCm) >= SEND_DELTA_CM
@@ -484,6 +488,8 @@ void maybePublishSensorData(float waterLevelCm, bool blindZone, bool forced) {
   generateUuidV4(r.corrId);
   r.ts = time(nullptr);
   r.levelCm = waterLevelCm;
+  r.distanceCm = distanceCm;
+  r.sensorHeightCm = sensorHeightCm;
   r.rssi = (int8_t)WiFi.RSSI();
   r.blindZone = blindZone;
   pendingCount++;
@@ -668,7 +674,7 @@ void loop() {
 
         float waterLevelCm = sensorHeightCm - distanceCm;
         if (waterLevelCm < 0) waterLevelCm = 0; // clamp: sensor above dry channel bottom reads as 0, not negative
-        maybePublishSensorData(waterLevelCm, false, forced);
+        maybePublishSensorData(waterLevelCm, distanceCm, false, forced);
       } else {
         // Zona buta: air (atau benda) < 28 cm dari sensor. Jangan dibuang — laporkan level
         // minimum yang pasti terlampaui. Alarm palsu lebih aman daripada banjir yang terlewat.
@@ -677,7 +683,7 @@ void loop() {
         Serial.print("Zona buta sensor -> lapor level minimum ");
         Serial.print(waterLevelCm);
         Serial.println(" cm (blind_zone)");
-        maybePublishSensorData(waterLevelCm, true, forced);
+        maybePublishSensorData(waterLevelCm, distanceCm, true, forced);
       }
       sensorFailStreak = 0;
       sensorError = nullptr;
@@ -688,7 +694,7 @@ void loop() {
       float waterLevelCm = sensorHeightCm - SENSOR_BLIND_ZONE_CM;
       if (waterLevelCm < 0) waterLevelCm = 0;
       Serial.println("Sensor gagal saat air dekat sensor -> anggap zona buta");
-      maybePublishSensorData(waterLevelCm, true, forced);
+      maybePublishSensorData(waterLevelCm, NAN, true, forced);
       snprintf(sensorErrorBuf, sizeof(sensorErrorBuf), "%s x%lu -> blind_zone", err, (unsigned long)sensorFailStreak);
       sensorError = sensorErrorBuf;
     } else {
