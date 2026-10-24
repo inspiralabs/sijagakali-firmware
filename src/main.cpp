@@ -113,7 +113,7 @@ Preferences prefs;
 #define STATUS_INTERVAL_SEC_DEFAULT 120
 uint32_t statusIntervalSec = STATUS_INTERVAL_SEC_DEFAULT;
 uint32_t statusSentAt = 0;
-#define FIRMWARE_VERSION "sijagakali-v1.3.2"
+#define FIRMWARE_VERSION "sijagakali-v1.3.3"
 
 esp_mqtt_client_handle_t mqttClient = nullptr;
 volatile bool mqttConnected = false;
@@ -320,32 +320,38 @@ void generateUuidV4(char out[37]) {
     b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
 }
 
-void syncTimeWib() {
-  configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com"); // UTC+7 (WIB), no DST
-  Serial.print("NTP: syncing time");
-  time_t now = time(nullptr);
-  uint32_t start = millis();
-  while (now < 8 * 3600 * 2 && millis() - start < 10000) { // wait for a plausible epoch time, max 10s
-    delay(250);
-    Serial.print(".");
-    now = time(nullptr);
-  }
-  Serial.println();
+void isoTimestampWib(char out[26], time_t when = time(nullptr)) {
+  struct tm t;
+  localtime_r(&when, &t);
+  snprintf(out, 26, "%04d-%02d-%02dT%02d:%02d:%02d+07:00",
+    t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
 }
 
 bool timeSynced() {
   return time(nullptr) >= 1600000000; // below = NTP never synced (or WiFi wasn't up in setup())
 }
 
-void ensureTimeSynced() {
-  if (!timeSynced()) syncTimeWib();
-}
+#define NTP_RETRY_MS 60000
+uint32_t ntpStartedAt = 0;
+bool ntpReported = false;
 
-void isoTimestampWib(char out[26], time_t when = time(nullptr)) {
-  struct tm t;
-  localtime_r(&when, &t);
-  snprintf(out, 26, "%04d-%02d-%02dT%02d:%02d:%02d+07:00",
-    t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+// Non-blocking: SNTP jalan di background dan resync sendiri tiap jam. Dimulai ulang tiap 60 s
+// selama belum sinkron (WiFi baru tersambung, server NTP tidak menjawab) tanpa menahan loop().
+void ensureTimeSynced() {
+  if (timeSynced()) {
+    if (!ntpReported) {
+      ntpReported = true;
+      char ts[26];
+      isoTimestampWib(ts);
+      Serial.printf("NTP: waktu tersinkron %s\n", ts);
+    }
+    return;
+  }
+  if (!wifiIsUp()) return;
+  if (ntpStartedAt != 0 && millis() - ntpStartedAt < NTP_RETRY_MS) return;
+  ntpStartedAt = millis();
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com"); // UTC+7 (WIB), no DST
+  Serial.println("NTP: sinkronisasi waktu dimulai");
 }
 
 void publishCommandAck(const char* requestId, bool ok, const char* detail, bool done) {
@@ -454,6 +460,7 @@ void pumpPending() {
 // Masuk antrean jika: belum pernah, diminta (sample_now), berubah >= SEND_DELTA_CM (naik/turun),
 // masuk/keluar zona buta, atau sudah readIntervalSec sejak kiriman terakhir.
 void maybePublishSensorData(float waterLevelCm, bool blindZone, bool forced) {
+  if (DEV_MODE) return; // WiFi mati: tidak ada yang dikirim, jangan antre atau tunggu NTP
   bool due = lastSentAt == 0 || forced
     || fabsf(waterLevelCm - lastSentLevelCm) >= SEND_DELTA_CM
     || blindZone != lastSentBlindZone
@@ -583,9 +590,10 @@ void setup() {
     Serial.println("WiFi not connected yet, will keep retrying in loop()");
   }
 
-  if (wifiIsUp()) {
-    syncTimeWib();
-  }
+  // Tunggu jam sekali saat boot (maks 5 s) agar data pertama tidak dilewati; setelah ini tidak pernah menunggu.
+  ensureTimeSynced();
+  for (uint32_t t0 = millis(); wifiIsUp() && !timeSynced() && millis() - t0 < 5000;) delay(100);
+  ensureTimeSynced(); // cetak "waktu tersinkron" bila sudah
 
   snprintf(topicBase, sizeof(topicBase), "sijagakali/%s", DEVICE_ID); // matches backend TOPICS: sijagakali/{device_id}/...
   snprintf(mqttClientId, sizeof(mqttClientId), "esp32-%s", DEVICE_ID);
@@ -612,7 +620,10 @@ void setup() {
 }
 
 void loop() {
-  if (!DEV_MODE) ensureWifi();
+  if (!DEV_MODE) {
+    ensureWifi();
+    ensureTimeSynced();
+  }
 
   if (otaUpdatePending) {
     performOtaUpdate(otaUpdateRequestId, otaUpdateUrl);
